@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Website Builder — Editor</title>
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+
+<header class="topstrip">
+  <h1 class="app-title">Website Builder — Editor</h1>
+
+  <div class="toolbar" id="toolbar" aria-label="Add a block to the current page">
+
+    <button type="button" class="tool-btn" data-block="heading" title="Append a heading block">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><text x="4" y="15" font-size="13" fill="currentColor" stroke="none">H</text></svg>
+      <span class="tl">Heading</span>
+    </button>
+
+    <button type="button" class="tool-btn" data-block="paragraph" title="Append a paragraph block">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><text x="5" y="15" font-size="14" fill="currentColor" stroke="none">&para;</text></svg>
+      <span class="tl">Paragraph</span>
+    </button>
+
+    <button type="button" class="tool-btn" data-block="image" title="Append an image block">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4" width="14" height="12" rx="1.5"/><circle cx="7" cy="8" r="1.6" fill="currentColor" stroke="none"/><path d="M5 14l4-4 3 3 2-2 3 3"/></svg>
+      <span class="tl">Image</span>
+    </button>
+
+    <button type="button" class="tool-btn" data-block="button" title="Append a link button block">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="7" width="14" height="7" rx="3.5"/></svg>
+      <span class="tl">Button</span>
+    </button>
+
+    <button type="button" class="tool-btn" data-block="image_button" title="Append an image button block">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="14" height="8" rx="1"/><rect x="5" y="13" width="10" height="5" rx="2.5"/></svg>
+      <span class="tl">Image button</span>
+    </button>
+
+    <button type="button" class="tool-btn" data-block="divider" title="Append a divider block">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10h14" stroke-dasharray="3 2"/></svg>
+      <span class="tl">Divider</span>
+    </button>
+
+    <button type="button" class="tool-btn" data-block="quote" title="Append a quote block">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 5v8M13 5v8"/></svg>
+      <span class="tl">Quote</span>
+    </button>
+
+    <button type="button" class="tool-btn" data-block="contact_card" title="Append a contact card block">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4" width="14" height="12" rx="1.5"/><path d="M6 8h8M6 11h6"/></svg>
+      <span class="tl">Contact card</span>
+    </button>
+
+    <button type="button" class="tool-btn" data-block="social_links" title="Append a social links block">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="5" cy="10" r="1.8" fill="currentColor" stroke="none"/><circle cx="14" cy="5" r="1.8" fill="currentColor" stroke="none"/><circle cx="14" cy="15" r="1.8" fill="currentColor" stroke="none"/><path d="M7 9l5-3M7 11l5 3"/></svg>
+      <span class="tl">Social links</span>
+    </button>
+
+    <button type="button" class="tool-btn" data-block="custom_html" title="Append a custom HTML block (raw)">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><text x="3" y="14" font-size="11" fill="currentColor" stroke="none">&lt;/&gt;</text></svg>
+      <span class="tl">Custom HTML</span>
+    </button>
+
+  </div>
+
+  <div class="status-bar" id="status-bar" aria-live="polite">Loading project&hellip;</div>
+</header>
+
+<main class="layout">
+
+  <aside class="rail" id="rail">
+    <div id="pages-section"></div>
+    <div id="page-ops"></div>
+    <div id="settings-section"></div>
+    <div id="export-panel"></div>
+  </aside>
+
+  <section class="card-col" id="card-area" aria-label="Block cards for the current page"></section>
+
+  <section class="preview-col" id="preview-col">
+    <div class="frame-wrap" id="frame-wrap">
+      <iframe id="preview-frame" name="sitepreview" title="Live preview of the current page"
+              sandbox="allow-forms allow-popups allow-scripts allow-same-origin"></iframe>
+    </div>
+    <p class="frame-hint">Preview note: the server CSP-sandboxes the frame document, so page scripts
+      (custom_html &lt;script&gt; tags) do NOT run in this frame either &mdash; the effective sandbox is the
+      intersection of the iframe attribute and the server&rsquo;s header. Scripts only run when you open the
+      exported files. Links inside the frame swap the preview in place.</p>
+  </section>
+
+</main>
+
+<datalist id="asset-options"></datalist>
+<datalist id="page-options"></datalist>
+
+<script src="/ui/app.js" defer></script>
+</body>
+</html>
