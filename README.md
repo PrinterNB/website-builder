@@ -15,18 +15,33 @@ lives in folders next to `builder.py`.
 
 ## Editing
 
-Open `http://localhost:8000`. The toolbar appends blocks (heading, paragraph,
-image, button, image button, divider, quote, contact card, social links,
-custom HTML). The page rail adds/renames/deletes pages, edits header/footer
-panels and theme (accent swatches, font, content width). Paragraph text supports
-`**bold**`, `*italic*`, `[label](to:pagekey)` internal and `[label](https://…)`
-external links. Changes autosave back into the model; the iframe preview refreshes.
+Open `http://localhost:8000`. The collapsible sidebar works in Wix order:
+
+- **Add Elements** chips: Text (heading, paragraph), Image, Button (incl. photo
+  buttons), Strip (full-bleed band), Decorative (divider, quote, box), Gallery,
+  Video (YouTube/Vimeo embed or link card), List (bullets/numbered), Anchor
+  (in-page jump target, buttons can carry `anchor`), Embed Code (raw HTML/CSS),
+  Social, Contact card.
+- **Add Sections** presets: Welcome, About Me, Features, Pricing, Promo strip,
+  Photo gallery, Contact — each inserts a ready-made block group.
+- **Pages & Menu**: add/rename/re-key/reorder/delete pages, site menu + footer
+  links, per-page header/footer overrides.
+- **Site Design**: accent (swatches or hex), page/text colors, font, content
+  width. **My Designs**: save any blocks as a named design in `model.designs`
+  and re-add them to any page later.
+- **Page Structure** cards (edit in place, reorder by drag, duplicate, delete)
+  and **Export & Reset**.
+- The preview iframe dominates the window; Desktop / Tablet / Phone buttons
+  reflow the page at 768 px / 390 px without touching the model.
+
+Paragraph text supports `**bold**`, `*italic*`, `[label](to:pagekey)` internal
+and `[label](https://…)` external links. Changes autosave to `POST /api/project`.
 
 ## Export
 
-Hit the **Export site** button (POST /api/export): writes `export/` (one HTML per
-page + `style.css` + only the assets actually referenced). Also downloadable as a
-zip (`/api/export/zip`) and listable at `/export-view`.
+Hit **Export site** (`POST /api/export`): writes `export/` — one HTML per page +
+`style.css` + only the referenced assets (gallery assets included). Also
+downloadable as a zip (`/api/export/zip`) and listable at `/export-view`.
 
 ## Hosting the export
 
@@ -35,6 +50,13 @@ The exported folder is self-contained with relative links — any static host wo
     python3 -m http.server 9000 -d export   # quick local serve
 
 or GitHub Pages / Netlify / Cloudflare Pages / drag-and-drop into any web server.
+Video embeds load their iframe from YouTube/Vimeo, so they need internet while
+you view a page; everything else (pages, styles, images) works offline.
+
+Out of scope, unlike Wix: its CMS apps — Blog, Store, Bookings, Events,
+Restaurants, Community — need a dynamic service; this static-file builder only
+renders pages and copies assets. External services are reached via buttons and
+video embeds.
 
 ## Privacy
 
@@ -44,6 +66,7 @@ with "Reset to blank project" in the editor.
 
 ## Warning: custom HTML is raw
 
-`custom_html` blocks are injected verbatim (no escaping), and their `<script>`
-tags are blocked in preview by the server's CSP sandbox but **will run** when
-you open the exported files. Only use it deliberately.
+`custom_html` blocks are injected verbatim (no escaping) and the preview sandbox
+grants scripts, so their `<script>` tags run **both** in the live preview and in
+the exported files. Ordinary text everywhere else is escaped first. Use it
+deliberately.

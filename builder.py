@@ -19,9 +19,13 @@
 #   GET  /ui/app.css /ui/app.js  exact two-file whitelist (never generic files)
 #   GET  /api/project            project.json bytes
 #   POST /api/project            full model JSON -> validated + atomic save
-#   GET  /preview/<key>.html     rendered page (CSP: sandbox allow-forms allow-popups).
-#                                Extra query params (?v=N) ignored. ?base=export
-#                                switches the EXPORT base for byte-diffing.
+#   GET  /preview/<key>.html     rendered page (CSP: sandbox allow-forms allow-popups
+#                                allow-scripts allow-same-origin -- the same grants the
+#                                editor iframe asks for, so the intersection keeps
+#                                video embeds and custom_html scripts alive). Extra
+#                                query params (?v=N) ignored. ?base=export switches the
+#                                EXPORT base for byte-diffing. /preview/index.html is
+#                                aliased to the "home" page (export names it index.html).
 #   GET  /preview/style.css      generated theme CSS, byte-identical to export
 #   GET  /preview/assets/<name>  asset bytes ONLY if name is in model["assets"]
 #                                (that dict-membership check is the traversal guard)
@@ -33,8 +37,10 @@
 #                                named by the last /export-view listing, so the
 #                                links on that page download/open via the server.
 #
-# Note on custom_html: a custom <script> will NOT run in preview (the sandbox
-# CSP above) but WILL run once the exported files are opened as plain files.
+# Note on custom_html: html is injected verbatim and its css is collected into the
+# page <style>. The preview sandbox grants scripts + same-origin (matching the
+# editor iframe), so custom script tags run BOTH in the live preview and once the
+# exported files are opened. Ordinary text everywhere else is html.escape'd first.
 
 import json
 import os
@@ -79,6 +85,9 @@ HEXCOLOR_RE = re.compile(r"\A#[0-9a-fA-F]{6}\Z")
 HEXCOLOR3_RE = re.compile(r"\A#([0-9a-fA-F]{3})\Z")
 EXPORT_REL_RE = re.compile(r"\A(?:[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+\Z")
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+YT_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{11}\Z")
+YT_PATH_RE = re.compile(r"\A/(?:embed|shorts|v|live)/([A-Za-z0-9_-]{11})\Z")
+VIMEO_PATH_RE = re.compile(r"\A/video/(\d{2,20})\Z")
 MAX_UPLOAD = 25 * 1024 * 1024
 
 FONTS = {
@@ -120,6 +129,28 @@ def page_href(key, base):
     if base == "" and key == "home":
         return "index.html"
     return base + key + ".html"
+
+
+def cache_stamp():
+    """Version token for preview-mode anchor URLs: changes whenever project.json
+    is rewritten. Only ever interpolated when base is the PREVIEW base, so the
+    exported bytes (base "") never contain it and stay byte-diffable."""
+    try:
+        return int(PROJECT_PATH.stat().st_mtime)
+    except OSError:
+        return 1
+
+
+def anchored_href(key, base, anchor):
+    """Internal href + optional "#anchor". Export: "about.html#pricing".
+    Preview: "/preview/about.html?v=N#pricing" -- cache-bust BEFORE the hash so
+    the browser refetches instead of jumping inside a possibly stale page."""
+    href = page_href(key, base)
+    if not anchor:
+        return href
+    if base == "":
+        return href + "#" + anchor
+    return href + "?v=%d#%s" % (cache_stamp(), anchor)
 
 
 def page_keys(model):
@@ -170,6 +201,11 @@ def r_paragraph(b, model, base):
     return "<p>%s</p>" % _md(esc(b.get("text", "")), model, base)
 
 
+def anchor_ok(value):
+    """Optional "anchor" on a button: a page-key-shaped slug, else ignored."""
+    return isinstance(value, str) and bool(PAGE_KEY_RE.match(value))
+
+
 def button_html(b, model, base):
     label = _md(esc(b.get("label", "")), model, base)
     style = b.get("style", "pill")
@@ -180,7 +216,8 @@ def button_html(b, model, base):
         key = str(b.get("to"))
         if key not in page_keys(model):
             return chip("Broken link: %s" % key)
-        href = page_href(key, base)
+        anchor = b.get("anchor") if anchor_ok(b.get("anchor")) else None
+        href = anchored_href(key, base, anchor)
     elif b.get("url") is not None:
         href = safe_url(b.get("url"))
         if href is None:
@@ -228,7 +265,8 @@ def r_image_button(b, model, base):
         key = str(b.get("to"))
         if key not in page_keys(model):
             return chip("Broken link: %s" % key)
-        href = page_href(key, base)
+        anchor = b.get("anchor") if anchor_ok(b.get("anchor")) else None
+        href = anchored_href(key, base, anchor)
     elif b.get("url") is not None:
         href = safe_url(b.get("url"))
         if href is None:
@@ -302,6 +340,144 @@ def r_custom_html(b, model, base):
     return str(b.get("html") or "")
 
 
+def r_strip(b, model, base):
+    """Full-bleed band. The escape past the content column is pure CSS
+    (.strip{width:100vw;margin-left:calc(50% - 50vw)}). bg: hex via css_color;
+    missing/invalid -> a light tint of the theme accent (mixed with the page bg)."""
+    color = css_color(b.get("bg"), "accent") if hex_ok(b.get("bg")) else strip_tint(model)
+    height = b.get("height") or "medium"
+    if height not in ("low", "medium", "tall"):
+        height = "medium"
+    align = b.get("align") or "center"
+    if align not in ("left", "center", "right"):
+        align = "center"
+    return ('<div class="strip strip-%s align-%s" style="background:%s">%s</div>'
+            % (height, align, html_escape(color, quote=True), _md(esc(b.get("text", "")), model, base)))
+
+
+def r_gallery(b, model, base):
+    """CSS grid of assets. Each name must be in model["assets"] AND on disk;
+    otherwise an inline chip stands in for the cell. 12-asset cap, 2-4 columns."""
+    known = model.get("assets") if isinstance(model.get("assets"), dict) else {}
+    names = b.get("assets")
+    if not isinstance(names, list):
+        return chip("bad gallery: assets must be a list")
+    names = names[:12]
+    cols = b.get("columns", 3)
+    try:
+        cols = int(cols)
+    except (TypeError, ValueError):
+        cols = 3
+    cols = max(2, min(4, cols))
+    cols = min(cols, max(2, len(names)))  # never more columns than cells
+    cells = []
+    for name in names:
+        name = str(name or "")
+        if name in known and asset_on_disk(name):
+            cells.append('<img class="gallery-cell" src="%s" alt="%s">'
+                         % (html_escape(asset_href(name, base), quote=True), esc(name)))
+        else:
+            cells.append(chip("missing asset: %s" % (name or "?")))
+    out = ['<figure class="gallery-fig">', '<div class="gallery gallery-%d">%s</div>' % (cols, "".join(cells))]
+    cap = b.get("caption")
+    if cap:
+        out.append('<figcaption class="gallery-caption">%s</figcaption>' % _md(esc(cap), model, base))
+    out.append("</figure>")
+    return "".join(out)
+
+
+def r_box(b, model, base):
+    """Padded rounded panel. outline: 1.5px accent border, transparent bg;
+    filled: accent bg + theme text color; soft: accent at ~12% opacity (inline
+    rgba so it tracks whatever accent the theme carries)."""
+    variant = b.get("variant") or "outline"
+    if variant not in ("outline", "filled", "soft"):
+        variant = "outline"
+    style = ""
+    if variant == "soft":
+        accent, _page_bg = theme_colors(model)
+        style = ' style="background:%s"' % html_escape(rgba_of(accent, 0.12), quote=True)
+    out = ['<div class="box-panel box-%s"%s>' % (variant, style)]
+    title = b.get("title")
+    if title:
+        out.append('<div class="box-title">%s</div>' % _md(esc(title), model, base))
+    lines = b.get("lines")
+    if isinstance(lines, list):
+        for ln in lines:
+            out.append('<p class="box-line">%s</p>' % _md(esc(ln), model, base))
+    out.append("</div>")
+    return "".join(out)
+
+
+def r_list(b, model, base):
+    items = b.get("items")
+    if not isinstance(items, list):
+        return chip("bad list: items must be a list")
+    ordered = b.get("ordered") is True
+    tag = "ol" if ordered else "ul"
+    cls = "list-ordered" if ordered else "list-plain"
+    return '<%s class="%s">%s</%s>' % (tag, cls,
+                                       "".join("<li>%s</li>" % _md(esc(i), model, base) for i in items), tag)
+
+
+def video_embed_src(url):
+    """Cookie-light embed URL for YouTube watch/shorts/embed/v/live/youtu.be and
+    player.vimeo.com/video links; None otherwise. The id is regex-anchored before
+    interpolation, so nothing from an arbitrary URL reaches the iframe src."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return None
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = parsed.path or ""
+    if host == "youtu.be":
+        vid = path.lstrip("/")
+        if YT_ID_RE.match(vid):
+            return "https://www.youtube-nocookie.com/embed/" + vid
+    elif host in ("youtube.com", "m.youtube.com"):
+        if path.startswith("/watch"):
+            vid = (urllib.parse.parse_qs(parsed.query).get("v") or [""])[0]
+            if YT_ID_RE.match(vid):
+                return "https://www.youtube-nocookie.com/embed/" + vid
+        else:
+            m = YT_PATH_RE.match(path)
+            if m:
+                return "https://www.youtube-nocookie.com/embed/" + m.group(1)
+    elif host == "player.vimeo.com":
+        m = VIMEO_PATH_RE.match(path)
+        if m:
+            return "https://player.vimeo.com/video/" + m.group(1)
+    return None
+
+
+def r_video(b, model, base):
+    """Embeddable links -> lazy 16:9 iframe (NEVER a <script>; the iframe is an
+    external document). Anything else -> styled a11y-named link card."""
+    raw = b.get("url")
+    href = safe_url(raw)
+    if href is None:
+        return chip("bad video link: %s" % (raw or "?"))
+    title = str(b.get("title") or "").strip()
+    embed = video_embed_src(href)
+    if embed:
+        return ('<div class="video-frame"><iframe class="video-iframe" loading="lazy" '
+                'src="%s" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" '
+                'allowfullscreen title="%s"></iframe></div>'
+                % (html_escape(embed, quote=True), esc(title or "Video")))
+    return ('<a class="video-card" href="%s" target="_blank" rel="noopener">%s</a>'
+            % (html_escape(href, quote=True), esc(title or href)))
+
+
+def r_anchor(b, model, base):
+    """Invisible in-page marker; name must be a page-key-shaped slug."""
+    name = b.get("name")
+    if not isinstance(name, str) or not PAGE_KEY_RE.match(name):
+        return chip("bad anchor: %r" % name)
+    return '<a id="%s"></a>' % html_escape(name, quote=True)
+
+
 def render_block(b, model, base):
     if not isinstance(b, dict):
         return chip("unknown block")
@@ -309,7 +485,8 @@ def render_block(b, model, base):
     fn = {"heading": r_heading, "paragraph": r_paragraph, "image": r_image,
           "button": r_button_block, "image_button": r_image_button, "divider": r_divider,
           "quote": r_quote, "contact_card": r_contact_card, "social_links": r_social_links,
-          "custom_html": r_custom_html}.get(t)
+          "custom_html": r_custom_html, "strip": r_strip, "gallery": r_gallery,
+          "box": r_box, "list": r_list, "video": r_video, "anchor": r_anchor}.get(t)
     if fn is None:
         return chip("unknown block: %s" % t)
     try:
@@ -385,8 +562,8 @@ def render_page(model, key, base):
     custom_css = "\n".join(css_out)
     if custom_css:
         head.append("<style>%s</style>" % custom_css)
-    head.append("<!-- Custom script tags written inside custom_html blocks are blocked "
-                "by the preview CSP header but run when the exported files are opened. -->")
+    head.append("<!-- custom_html injects markup verbatim; with scripts allowed by the "
+                "preview sandbox, its script tags run both live and in exported files. -->")
 
     parts = ["<!DOCTYPE html>", '<html lang="%s">' % html_escape(lang, quote=True), "<head>"] + head + \
             ["</head>", "<body>", header_html(header, model, base),
@@ -405,6 +582,42 @@ def css_color(value, kind):
     if m3:  # the UI accepts #abc shorthand; expand to #aabbcc
         return "#" + "".join(c * 2 for c in m3.group(1))
     return COLOR_FALLBACK[kind]
+
+
+def hex_ok(value):
+    """True only for real #rgb / #rrggbb hexes (css_color's fallback is for
+    rendering; validation and callers need to know whether the value was valid)."""
+    v = str(value or "")
+    return bool(HEXCOLOR_RE.match(v) or HEXCOLOR3_RE.match(v))
+
+
+def rgba_of(hex_value, alpha):
+    """#rrggbb -> rgba(r,g,b,alpha). Only ever called on css_color() output."""
+    return "rgba(%d,%d,%d,%g)" % (int(hex_value[1:3], 16), int(hex_value[3:5], 16),
+                                  int(hex_value[5:7], 16), alpha)
+
+
+def mix_hex(first, second, weight):
+    """Blend two #rrggbb hexes; weight = fraction of `first` (clamped 0..1)."""
+    w = max(0.0, min(1.0, float(weight)))
+
+    def chan(i, j):
+        return int(round(i * w + j * (1.0 - w)))
+
+    return "#%02x%02x%02x" % (chan(int(first[1:3], 16), int(second[1:3], 16)),
+                              chan(int(first[3:5], 16), int(second[3:5], 16)),
+                              chan(int(first[5:7], 16), int(second[5:7], 16)))
+
+
+def theme_colors(model):
+    th = model.get("theme") if isinstance(model.get("theme"), dict) else {}
+    return css_color(th.get("accent"), "accent"), css_color(th.get("background"), "background")
+
+
+def strip_tint(model):
+    """Fallback strip bg: a light tint of the theme accent over the page bg."""
+    accent, page_bg = theme_colors(model)
+    return mix_hex(accent, page_bg, 0.18)
 
 
 def css_content_width(value):
@@ -437,6 +650,8 @@ def gen_css(model):
         ".logo{display:block;margin:0 auto;max-width:180px}",
         ".header-buttons{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin-top:12px}",
         ".footer-buttons{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin-top:10px}",
+        ".site-footer{max-width:var(--content);margin:0 auto;padding:18px 20px 24px;text-align:center}",
+        ".footer-text{font-size:.9em;opacity:.85}",
         ".btn{display:inline-block;padding:9px 18px;font-weight:600;text-decoration:none;text-transform:none}",
         ".pill{border-radius:999px;background:var(--accent);color:%s}" % "#ffffff",
         ".box{border-radius:3px;background:var(--accent);color:#ffffff}",
@@ -458,8 +673,27 @@ def gen_css(model):
         ".social-links{display:flex;flex-wrap:wrap;gap:14px;margin:1em 0}.social-link{text-decoration:none}",
         ".chip{font-family:%s;border:1px dashed %s;background:#fff3cd;color:#713d0d;padding:2px 6px}" % (FONTS["mono"], "#b4482c"),
         ".sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(1px 1px 1px 1px);clip-path:rect(0px 0px 0px 0px)}",
+        ".strip{width:100vw;margin:1.4em 0;margin-left:calc(50% - 50vw);padding:18px 26px;text-align:center}",
+        ".strip-low{padding:10px 26px}.strip-medium{padding:24px 26px}.strip-tall{padding:48px 26px}",
+        ".align-left{text-align:left}.align-center{text-align:center}.align-right{text-align:right}",
+        ".gallery-fig{margin:1em 0}.gallery{display:grid;gap:10px;margin:0}"
+        ".gallery-2{grid-template-columns:repeat(2,1fr)}.gallery-3{grid-template-columns:repeat(3,1fr)}"
+        ".gallery-4{grid-template-columns:repeat(4,1fr)}",
+        ".gallery img{width:100%;aspect-ratio:3/2;object-fit:cover}"
+        ".gallery-fig .gallery-caption{font-size:.85em;opacity:.8;margin-top:8px}",
+        ".box-panel{border-radius:12px;padding:16px 18px;margin:1em 0}"
+        ".box-outline{border:1.5px solid var(--accent)}.box-filled{background:var(--accent);color:var(--text)}",
+        ".box-title{font-weight:700;margin:.15em 0 .5em}.box-line{margin:.2em 0 .7em}",
+        ".list-plain{margin:.2em 0 1em;padding:0 0 0 1.4em}.list-ordered{margin:.2em 0 1em;padding:0 0 0 1.6em}"
+        ".list-plain li,.list-ordered li{margin:.15em 0}",
+        ".video-frame{position:relative;padding-top:56.25%;margin:1.2em 0}"
+        ".video-iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0}",
+        ".video-card{display:block;border:1.5px solid var(--accent);border-radius:10px;padding:14px 18px;margin:1em 0;text-decoration:none}"
+        ".video-card:hover{filter:brightness(1.12)}",
         "@media (max-width:640px){.content{padding:22px 14px 34px}.site-header{padding:18px 12px 12px}"
-        ".header-buttons{flex-direction:column;align-items:center;gap:6px}.footer-buttons{flex-direction:column;align-items:center;gap:6px}}",
+        ".header-buttons{flex-direction:column;align-items:center;gap:6px}.footer-buttons{flex-direction:column;align-items:center;gap:6px}"
+        ".gallery{grid-template-columns:1fr}.strip-low{padding:9px 16px}.strip-medium{padding:16px 16px}"
+        ".strip-tall{padding:28px 16px}.box-panel{padding:13px 14px}.video-card{padding:11px 14px}.video-frame{margin:0.8em 0}}",
     ]
     return "\n".join(parts) + "\n"
 
@@ -499,6 +733,12 @@ def referenced_assets(model):
             t = b.get("type")
             if t in ("image", "image_button") and b.get("asset"):
                 names.add(str(b["asset"]))
+            elif t == "gallery":
+                gnames = b.get("assets")
+                if isinstance(gnames, list):
+                    for n in gnames:
+                        if isinstance(n, str):
+                            names.add(n)
         for ov in (p.get("header_override"),):
             if isinstance(ov, dict) and ov.get("logo_asset"):
                 names.add(str(ov["logo_asset"]))
@@ -573,12 +813,74 @@ def validate_button(b, where, errors):
     has_url = isinstance(url, str) and url.strip() != ""
     if not has_to and not has_url:
         errors.append('%s needs a link target: give it "to" (a page key) or "url" (a web link)' % where)
+    anchor = b.get("anchor")
+    if anchor is not None and has_to and (not isinstance(anchor, str) or not PAGE_KEY_RE.match(anchor)):
+        errors.append('%s anchor must match ^[a-z][a-z0-9-]{0,31}$ (got: %r)' % (where, anchor))
+
+
+def validate_block(b, where, asset_names, errors):
+    """Per-block validation shared by page blocks and design blocks. Strict
+    where the schema pins a value (a bad value is rejected at POST time);
+    lenient elsewhere because the renderers chip/clamp anyway -- hand-edited
+    project.json must still never crash."""
+    if not isinstance(b, dict):
+        errors.append("%s must be an object" % where)
+        return
+    t = b.get("type")
+    if t in ("button", "image_button"):
+        validate_button(b, where, errors)
+    elif t == "strip":
+        bg = b.get("bg")
+        if bg is not None and not hex_ok(bg):
+            errors.append('%s.bg must be #rgb or #rrggbb (got: %r)' % (where, bg))
+        for field, allowed in (("height", ("low", "medium", "tall")), ("align", ("left", "center", "right"))):
+            if field in b and b[field] is not None and b[field] not in allowed:
+                errors.append("%s.%s must be %s (got: %r)" % (where, field, "|".join(allowed), b[field]))
+        if b.get("text") is not None and not isinstance(b["text"], str):
+            errors.append("%s.text must be a string" % where)
+    elif t == "gallery":
+        names = b.get("assets")
+        if not isinstance(names, list):
+            errors.append("%s.assets must be a list of asset names" % where)
+        else:
+            for n in names:
+                if not isinstance(n, str) or n not in asset_names:
+                    errors.append('gallery %s references an asset not in model.assets: %r' % (where, n))
+        cols = b.get("columns", 3)
+        if cols not in (2, 3, 4):
+            errors.append("%s.columns must be 2, 3 or 4 (got: %r)" % (where, cols))
+        if b.get("caption") is not None and not isinstance(b["caption"], str):
+            errors.append("%s.caption must be a string" % where)
+    elif t == "box":
+        v = b.get("variant")
+        if v is not None and v not in ("outline", "filled", "soft"):
+            errors.append("%s.variant must be outline|filled|soft (got: %r)" % (where, v))
+        if b.get("title") is not None and not isinstance(b["title"], str):
+            errors.append("%s.title must be a string" % where)
+        if b.get("lines") is not None and not isinstance(b["lines"], list):
+            errors.append("%s.lines must be a list" % where)
+    elif t == "list":
+        if not isinstance(b.get("items"), list):
+            errors.append("%s.items must be a list" % where)
+        if "ordered" in b and b["ordered"] is not None and not isinstance(b["ordered"], bool):
+            errors.append("%s.ordered must be true or false (got: %r)" % (where, b["ordered"]))
+    elif t == "video":
+        if safe_url(b.get("url")) is None:
+            errors.append("%s.url must be a non-empty http(s)-safe link" % where)
+        if b.get("title") is not None and not isinstance(b["title"], str):
+            errors.append("%s.title must be a string" % where)
+    elif t == "anchor":
+        name = b.get("name")
+        if not isinstance(name, str) or not PAGE_KEY_RE.match(name):
+            errors.append('%s.name must match ^[a-z][a-z0-9-]{0,31}$ (got: %r)' % (where, name))
+    # unknown block types stay unvalidated on purpose: they render as visible chips
 
 
 def validate_model(m):
     errors = []
     if not isinstance(m, dict):
         return ["root must be a JSON object"]
+    asset_names = set(m.get("assets")) if isinstance(m.get("assets"), dict) else set()
 
     th = m.get("theme")
     if not isinstance(th, dict):
@@ -618,9 +920,10 @@ def validate_model(m):
                 errors.append("%s.blocks must be a list" % where)
             else:
                 for bi, b in enumerate(p.get("blocks") or []):
-                    if isinstance(b, dict) and b.get("type") in ("button", "image_button"):
-                        validate_button(b, 'button block #%d in page "%s"'
-                                        % (bi + 1, p.get("key") or "?"), errors)
+                    bt = b.get("type") if isinstance(b, dict) else None
+                    what = "button block" if bt in ("button", "image_button") else "block"
+                    validate_block(b, "%s #%d in page \"%s\""
+                                   % (what, bi + 1, p.get("key") or "?"), asset_names, errors)
             for field in ("header_override", "footer_override"):
                 ov = p.get(field)
                 if ov is not None:
@@ -645,6 +948,31 @@ def validate_model(m):
         else:
             for bi, b in enumerate(obj.get("buttons") or []):
                 validate_button(b, "%s button #%d" % (field, bi + 1), errors)
+
+    # "designs": the UI-managed block catalogue. Absent/null = tolerated (back-compat).
+    designs = m.get("designs")
+    if designs is not None and not isinstance(designs, list):
+        errors.append("designs must be a list")
+    if isinstance(designs, list):
+        for di, d in enumerate(designs):
+            where = "designs[%d]" % di
+            if not isinstance(d, dict):
+                errors.append("%s must be an object" % where)
+                continue
+            name = d.get("name")
+            if not isinstance(name, str) or name.strip() == "" or len(name) > 40:
+                errors.append("%s.name must be a non-empty string of at most 40 characters (got: %r)"
+                              % (where, name))
+            bl = d.get("blocks")
+            if bl is not None and not isinstance(bl, list):
+                errors.append("%s.blocks must be a list" % where)
+            else:
+                for bi, b in enumerate(bl or []):
+                    bt = b.get("type") if isinstance(b, dict) else None
+                    what = "button block" if bt in ("button", "image_button") else "block"
+                    validate_block(b, "%s #%d in design \"%s\""
+                                   % (what, bi + 1, name if isinstance(name, str) else "?"),
+                                   asset_names, errors)
 
     assets = m.get("assets", {})
     if not isinstance(assets, dict):
@@ -715,8 +1043,9 @@ def make_png(width, height):
             + chunk(b"IDAT", zlib.compress(bytes(rows), 9)) + chunk(b"IEND", b""))
 
 
-def build_demo_model(photo_bytes, portrait_bytes):
-    """The seeded demo doubles as the schema reference."""
+def build_demo_model(photo_bytes, portrait_bytes, square_bytes):
+    """The seeded demo doubles as the schema reference: it exercises every block
+    type, including strip/gallery/box/list/video/anchor and anchored nav."""
     stamp = iso_now()
     header = {
         "title": "Demo Site",
@@ -725,6 +1054,7 @@ def build_demo_model(photo_bytes, portrait_bytes):
         "buttons": [
             {"label": "Home", "to": "home"},
             {"label": "About", "to": "about"},
+            {"label": "Pricing", "to": "about", "anchor": "pricing"},
             {"label": "Email", "url": "mailto:demo@example.com"},
             {"label": "Gear", "url": "https://example.com/gear", "newtab": True},
         ],
@@ -736,6 +1066,9 @@ def build_demo_model(photo_bytes, portrait_bytes):
         "footer_override": None,
         "blocks": [
             {"type": "heading", "text": "Welcome to the Demo Site", "level": 1},
+            {"type": "strip", "bg": "#173f5f",
+             "text": "*Full-bleed:* this band ignores the content column and spans the whole viewport.",
+             "align": "center", "height": "medium"},
             {"type": "paragraph",
              "text": ("This whole site lives in **one JSON file**. The editor writes markdown-lite: "
                       "*emphasis*, **strong**, [About](to:about) internal links and "
@@ -749,6 +1082,11 @@ def build_demo_model(photo_bytes, portrait_bytes):
             {"type": "divider"},
             {"type": "quote", "text": "One renderer, two destinations: preview and disk.",
              "attribution": "builder.py"},
+            {"type": "box", "variant": "soft", "title": "Why one renderer?",
+             "lines": ["Preview and export **share one code path**.",
+                       "What you see at *localhost:8000* is exactly what lands on disk.",
+                       "Panels like this one stay inside the reading column."]},
+            {"type": "divider"},
             {"type": "custom_html",
              "html": ('<div class="demo-grid"><div class="demo-cell">Custom HTML is injected verbatim.</div>'
                       '<div class="demo-cell">Its CSS comes from the same model.</div></div>'),
@@ -773,6 +1111,21 @@ def build_demo_model(photo_bytes, portrait_bytes):
             {"type": "contact_card",
              "lines": [{"label": "Email", "value": "demo@example.com", "url": "mailto:demo@example.com"},
                        {"label": "Phone", "value": "+1 555 0134", "url": None}]},
+            {"type": "anchor", "name": "pricing"},
+            {"type": "heading", "text": "Pricing (fictional)", "level": 3},
+            {"type": "list", "ordered": True,
+             "items": ["**Starter** - 9 credits/mo", "Pro - 19 credits/mo", "Studio - 29 credits/mo"]},
+            {"type": "gallery",
+             "assets": ["demo-photo.png", "demo-portrait.png", "demo-square.png"],
+             "columns": 3,
+             "caption": "Three **generated** gradients: wide, *portrait* and square."},
+            {"type": "video",
+             "url": "https://www.youtube.com/watch?v=eXrd5sNdacA",
+             "title": "NASA's First-Ever Tech Expo and Air Show (real embed)"},
+            {"type": "list", "ordered": False,
+             "items": ["Bad values become **visible chips**, never crashes",
+                       "Unknown block types chip too",
+                       "*Every* text field goes through html.escape first"]},
             {"type": "social_links",
              "items": [{"network": "GitHub", "url": "https://github.com/demo-org", "label": None},
                        {"network": "Mastodon", "url": "https://mastodon.social/@demo", "label": "Mastodon"}]},
@@ -791,8 +1144,16 @@ def build_demo_model(photo_bytes, portrait_bytes):
                        {"label": "Gear", "url": "https://example.com/gear", "newtab": True},
                    ]},
         "pages": [home, about],
+        "designs": [
+            {"name": "Starter strip",
+             "blocks": [{"type": "strip", "bg": "#173f5f", "text": "New **tagline** band",
+                        "align": "center", "height": "low"},
+                        {"type": "box", "variant": "outline", "title": "Draft callout",
+                         "lines": ["UI-managed catalogue entry; never rendered by the server."]}]},
+        ],
         "assets": {"demo-photo.png": {"uploaded": stamp, "bytes": len(photo_bytes)},
-                   "demo-portrait.png": {"uploaded": stamp, "bytes": len(portrait_bytes)}},
+                   "demo-portrait.png": {"uploaded": stamp, "bytes": len(portrait_bytes)},
+                   "demo-square.png": {"uploaded": stamp, "bytes": len(square_bytes)}},
     }
 
 
@@ -804,9 +1165,11 @@ def ensure_seed():
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
     photo = make_png(300, 200)
     portrait = make_png(200, 200)
+    square = make_png(240, 240)
     (ASSETS_DIR / "demo-photo.png").write_bytes(photo)
     (ASSETS_DIR / "demo-portrait.png").write_bytes(portrait)
-    save_model(build_demo_model(photo, portrait))
+    (ASSETS_DIR / "demo-square.png").write_bytes(square)
+    save_model(build_demo_model(photo, portrait, square))
 
 
 # ---------------------------------------------------------------- HTTP layer
@@ -971,13 +1334,19 @@ class Handler(BaseHTTPRequestHandler):
         if tail.endswith(".html"):
             key = tail[:-5]
             model = load_model()
-            if not isinstance(model, dict) or key not in page_keys(model):
+            if not isinstance(model, dict):
+                self._not_found(tail)
+                return
+            if key not in page_keys(model) and key == "index":
+                key = "home"  # preview alias: the export calls the home page index.html
+            if key not in page_keys(model):
                 self._not_found(tail)
                 return
             base = "" if (q.get("base") or [""])[0] == "export" else "/preview/"
             doc = render_page(model, key, base)
             self._send(200, "text/html; charset=utf-8", doc,
-                       {"Content-Security-Policy": "sandbox allow-forms allow-popups"})
+                       {"Content-Security-Policy":
+                        "sandbox allow-forms allow-popups allow-scripts allow-same-origin"})
             return
         self._not_found(tail)
 
